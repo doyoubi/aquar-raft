@@ -1,7 +1,12 @@
 import socket
+import logging
 import StringIO
+
 import redis_protocol
 from gevent.server import StreamServer
+
+
+logger = logging.getLogger(__name__)
 
 
 class InvalidRedisPacket(Exception):
@@ -54,13 +59,15 @@ class RedisProtocolServer(object):
         self.cmd_handler = cmd_handler
 
     def handle_conn(self, socket, address):
+        logger.info('accepted new connection')
+        addr = '{}:{}'.format(*address)
         proto_handler = RedisProtocolHandler(socket, self.cmd_handler)
         while True:
             data = socket.recv(10)
             if not data:
                 print("client disconnected")
                 break
-            proto_handler.handle_read(data)
+            proto_handler.handle_read(addr, data)
         socket.close()
 
 
@@ -70,13 +77,13 @@ class RedisProtocolHandler(object):
         self.socket = socket
         self.callback = callback
 
-    def handle_read(self, data):
+    def handle_read(self, address, data):
         self.data += data
         while self.data:
             cmd, pos = parse_redis_cmd(self.data)
             if cmd is None:
                 return
-            self.callback(cmd, self)
+            self.callback(address, cmd, self)
             self.data = self.data[pos:]
 
     def send_data(self, data):
@@ -93,29 +100,8 @@ class RedisProtocolHandler(object):
     def send(self, data):
         self.socket.sendall(data)
 
-
-def simple_handler(cmd, proto_handler):
-    if cmd[0].lower() == 'ping':
-        proto_handler.send('+PONG\r\n')
-    elif cmd[0].lower() == 'get':
-        proto_handler.send_data('Foo')
-    elif cmd[0].lower() == 'set':
-        proto_handler.send('+OK\r\n')
-    else:
-        proto_handler.send_err('Unknown command')
-
-
-if __name__ == '__main__':
-    server = StreamServer(('0.0.0.0', 7777),
-        RedisProtocolServer(simple_handler).handle_conn)
-    # to start the server asynchronously, use its start() method;
-    # we use blocking serve_forever() here because we have no other jobs
-    print('Starting echo server on port 7777')
-    server.serve_forever()
-
-
 # Example:
-# def pong(cmd, proto_handler):
+# def pong(address, cmd, proto_handler):
 #    proto_handler.send('+PONG\r\n')
 
 # server = StreamServer(('0.0.0.0', 7777), RedisProtocolServer(pong).handle_conn)

@@ -3,7 +3,11 @@ import time
 import random
 import logging
 
-import config
+from .config import (
+    ELECTION_TIMEOUT_RANGE,
+    HEART_BEAT_TIMEOUT,
+    BROADCAST_REQUEST_VOTE_INTERVAL,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -11,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 class Rpc(object):
     def __init__(self, term):
+        self.node_id = None
         self.term = term
 
 
@@ -18,18 +23,21 @@ class RequestVote(Rpc):
     def __init__(self, term, candidate_id):
         super(RequestVote, self).__init__(term)
         self.candidate_id = candidate_id
+        self.node_id = candidate_id
 
 
 class AppendEntries(Rpc):
     def __init__(self, term, leader_id):
         super(AppendEntries, self).__init__(term)
         self.leader_id = leader_id
+        self.node_id = leader_id
 
 
 class RequestVoteResponse(Rpc):
-    def __init__(self, term, vote_granted):
+    def __init__(self, node_id, term, vote_granted):
         super(RequestVoteResponse, self).__init__(term)
         self.vote_granted = vote_granted
+        self.node_id = node_id
 
     def to_dict(self):
         return {
@@ -39,9 +47,10 @@ class RequestVoteResponse(Rpc):
 
 
 class AppendEntriesResponse(Rpc):
-    def __init__(self, term, success):
+    def __init__(self, node_id, term, success):
         super(AppendEntriesResponse, self).__init__(term)
         self.success = success
+        self.node_id = node_id
 
     def to_dict(self):
         return {
@@ -70,7 +79,7 @@ class ElectionTimer(Timer):
         super(ElectionTimer, self).__init__(callback, None)
 
     def reset(self):
-        self.timeout = random.randint(*config.ELECTION_TIMEOUT_RANGE)
+        self.timeout = random.randint(*ELECTION_TIMEOUT_RANGE)
         super(ElectionTimer, self).reset()
 
 
@@ -87,7 +96,7 @@ class State(object):
 
         self.timers = []
         self.send_queue = []  # (node, Rpc)
-        self.recv_queue = []
+        self.recv_queue = []  # Rpc
 
     def to_dict(self):
         return {
@@ -106,14 +115,17 @@ class State(object):
         self.recv_queue.append(rpc)
 
     # call by outer object
-    def pop_send_queue():
+    def pop_send_queue(self):
+        if len(self.send_queue) == 0:
+            return None, None
         return self.send_queue.pop(0)
 
     # call by outer object
-    def tick():
+    def tick(self):
         while len(self.recv_queue):
             rpc = self.recv_queue.pop(0)
-            self.handle_rpc(rpc)
+            response = self.handle_rpc(rpc)
+            self.send_queue.append((rpc.node_id, response))
         self.cron()
 
     def cron(self):
@@ -148,16 +160,16 @@ class State(object):
         return self.handler.state
 
     def request_vote_handler(self, rpc):
-        raise NotImplemented
+        raise NotImplementedError
 
     def append_entries_handler(self, rpc):
-        raise NotImplemented
+        raise NotImplementedError
 
     def request_vote_response_handler(self, rpc):
-        self.log('rpc not handled: {}'.format(rpc))
+        self.error('rpc not handled: {}'.format(rpc.to_dict()))
 
     def append_entries_response_handler(self, rpc):
-        self.log('rpc not handled: {}'.format(rpc))
+        self.error('rpc not handled: {}'.format(rpc.to_dict()))
 
     def change_to_candidate(self):
         return self.change_state(CandidateState)
@@ -171,9 +183,12 @@ class State(object):
     def debug(self, msg):
         self.log('debug', msg)
 
+    def error(self, msg):
+        self.log('error', msg)
+
     def log(self, level, msg):
         state = type(self).__name__
-        node_name = self.node_table[self.node_id].name
+        node_name = self.node_id
         log_func = getattr(logger, level)
         log_func('[{}:{}({})] {}'.format(
             node_name, state, self.current_term, msg))
@@ -184,7 +199,7 @@ class LeaderState(State):
         super(LeaderState, self).__init__(server, term)
         self.leader_id = self.node_id
         self.timers = [
-            Timer(self.broadcast_heartbeat, config.HEART_BEAT_TIMEOUT)]
+            Timer(self.broadcast_heartbeat, HEART_BEAT_TIMEOUT)]
         self.broadcast_heartbeat()
 
     def broadcast_heartbeat(self):
@@ -194,7 +209,7 @@ class LeaderState(State):
                 continue
             self.debug('sending heartbeat to {}'.format(node_id))
             # self.server.send_rpc(node, heartbeat)
-            self.send_queue.append((node, heartbeat))
+            self.send_queue.append((node_id, heartbeat))
         self.timers[0].reset()
 
     def append_entries_handler(self, rpc):
@@ -205,12 +220,12 @@ class LeaderState(State):
             self.update_term_if_needed(rpc)
             new_state = self.change_to_follower()
             new_state.leader_id = rpc.leader_id
-            return AppendEntriesResponse(self.current_term, True)
+            return AppendEntriesResponse(self.node_id, self.current_term, True)
         elif rpc.term < self.current_term:
             self.info(
                 'heartbeat from another leader with lower term {} > {}' \
                     .format(self.current_term, rpc.term))
-            return AppendEntriesResponse(self.current_term, False)
+            return AppendEntriesResponse(self.node_id, self.current_term, False)
         else:
             raise Exception(
                 'Invalid state, leader receive heartbeat from same term')
@@ -224,7 +239,7 @@ class LeaderState(State):
         else:
             self.info('rejected vote request from {}'.format(
                 rpc.candidate_id))
-        return RequestVoteResponse(self.current_term, vote_granted)
+        return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def append_entries_response_handler(self, response):
         if response.term > self.current_term:
@@ -253,7 +268,7 @@ class FollowerState(State):
                 rpc.leader_id))
         self.update_term_if_needed(rpc)
         self.timers[0].reset()
-        return AppendEntriesResponse(self.current_term, success)
+        return AppendEntriesResponse(self.node_id, self.current_term, success)
 
     def request_vote_handler(self, rpc):
         self.info('receive request vote from {}'.format(rpc.candidate_id))
@@ -268,7 +283,7 @@ class FollowerState(State):
         else:
             self.info('rejected vote request from {}'.format(
                 rpc.candidate_id))
-        return RequestVoteResponse(self.current_term, vote_granted)
+        return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
 
 class CandidateState(State):
@@ -280,7 +295,7 @@ class CandidateState(State):
         self.timers = [
             ElectionTimer(self.change_to_candidate),
             Timer(self.broadcast_request_vote,
-                config.BROADCAST_REQUEST_VOTE_INTERVAL)
+                BROADCAST_REQUEST_VOTE_INTERVAL)
         ]
         self.broadcast_request_vote()
 
@@ -290,7 +305,7 @@ class CandidateState(State):
             if node_id == self.node_id:
                 continue
             # self.server.send_rpc(node, request_vote)
-            self.send_queue.append((node, request_vote))
+            self.send_queue.append((node_id, request_vote))
         self.timers[1].reset()
 
     def append_entries_handler(self, rpc):
@@ -299,9 +314,9 @@ class CandidateState(State):
             self.update_term_if_needed(rpc)
             new_state = self.change_to_follower()
             new_state.leader_id = rpc.leader_id
-            return AppendEntriesResponse(self.current_term, True)
+            return AppendEntriesResponse(self.node_id, self.current_term, True)
         self.info('reject heartbeat from {}'.format(rpc.leader_id))
-        return AppendEntriesResponse(self.current_term, False)
+        return AppendEntriesResponse(self.node_id, self.current_term, False)
 
     def request_vote_handler(self, rpc):
         self.info('receive request vote from {}'.format(rpc.candidate_id))
@@ -314,7 +329,7 @@ class CandidateState(State):
         else:
             self.info('rejected vote request from {}'.format(
                 rpc.candidate_id))
-        return RequestVoteResponse(self.current_term, vote_granted)
+        return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def check_quorum(self):
         if self.vote_num > len(self.node_table) / 2:
