@@ -28,7 +28,7 @@ def simple_handler(cmd, proto_handler):
 
 
 def serve():
-    # Usage: python main.py node_id
+    # Usage: python some_script.py node_id
     node_id = sys.argv[1]
     addr = NODE_TABLE[node_id]
     raft_server = RaftServer(node_id)

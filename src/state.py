@@ -5,7 +5,7 @@ import logging
 
 from .config import (
     ELECTION_TIMEOUT_RANGE,
-    HEART_BEAT_TIMEOUT,
+    HEART_BEAT_INTERVAL,
     BROADCAST_REQUEST_VOTE_INTERVAL,
 )
 
@@ -199,7 +199,7 @@ class LeaderState(State):
         super(LeaderState, self).__init__(server, term)
         self.leader_id = self.node_id
         self.timers = [
-            Timer(self.broadcast_heartbeat, HEART_BEAT_TIMEOUT)]
+            Timer(self.broadcast_heartbeat, HEART_BEAT_INTERVAL)]
         self.broadcast_heartbeat()
 
     def broadcast_heartbeat(self):
@@ -291,7 +291,7 @@ class CandidateState(State):
         super(CandidateState, self).__init__(server, term)
         self.current_term += 1
         self.voted_for = self.node_id
-        self.vote_num = 1
+        self.votes = { self.node_id }
         self.timers = [
             ElectionTimer(self.change_to_candidate),
             Timer(self.broadcast_request_vote,
@@ -332,13 +332,13 @@ class CandidateState(State):
         return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def check_quorum(self):
-        if self.vote_num > len(self.node_table) / 2:
+        if len(self.votes) > len(self.node_table) / 2:
             self.change_state(LeaderState)
 
     def request_vote_response_handler(self, response):
         if response.vote_granted:
             self.info('get a vote')
-            self.vote_num += 1
+            self.votes.add(response.node_id)
             self.check_quorum()
         if response.term > self.current_term:
             self.info('find higher term')

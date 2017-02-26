@@ -1,2 +1,3 @@
 redis-protocol==0.0.2
 gevent==1.2.1
+redis==2.10.5

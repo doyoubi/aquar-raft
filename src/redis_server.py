@@ -65,7 +65,6 @@ class RedisProtocolServer(object):
         while True:
             data = socket.recv(10)
             if not data:
-                print("client disconnected")
                 break
             proto_handler.handle_read(addr, data)
         socket.close()
