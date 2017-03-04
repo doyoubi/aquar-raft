@@ -5,7 +5,8 @@ import logging
 
 from .config import (
     ELECTION_TIMEOUT_RANGE,
-    HEART_BEAT_INTERVAL,
+    IDLE_HEART_BEAT_INTERVAL,
+    PROPOSE_HEART_BEAT_INTERVAL,
     BROADCAST_REQUEST_VOTE_INTERVAL,
 )
 
@@ -14,26 +15,36 @@ logger = logging.getLogger(__name__)
 
 
 class Rpc(object):
+    pass
+
+
+class InnerRpc(Rpc):
     def __init__(self, term):
         self.node_id = None
         self.term = term
 
 
-class RequestVote(Rpc):
+class RequestVote(InnerRpc):
     def __init__(self, term, candidate_id):
         super(RequestVote, self).__init__(term)
         self.candidate_id = candidate_id
         self.node_id = candidate_id
 
 
-class AppendEntries(Rpc):
-    def __init__(self, term, leader_id):
+class AppendEntries(InnerRpc):
+    def __init__(self, term, leader_id,
+            prev_log_index, prev_log_term, entries, leader_commit):
         super(AppendEntries, self).__init__(term)
         self.leader_id = leader_id
         self.node_id = leader_id
+        # proposol
+        self.prev_log_index = prev_log_index
+        self.prev_log_term = prev_log_term
+        self.leader_commit = leader_commit
+        self.entries = entries
 
 
-class RequestVoteResponse(Rpc):
+class RequestVoteResponse(InnerRpc):
     def __init__(self, node_id, term, vote_granted):
         super(RequestVoteResponse, self).__init__(term)
         self.vote_granted = vote_granted
@@ -46,11 +57,13 @@ class RequestVoteResponse(Rpc):
         }
 
 
-class AppendEntriesResponse(Rpc):
-    def __init__(self, node_id, term, success):
+class AppendEntriesResponse(InnerRpc):
+    def __init__(self, node_id, term, success, last_recv_index):
         super(AppendEntriesResponse, self).__init__(term)
         self.success = success
         self.node_id = node_id
+        # last_recv_index will be None if not success
+        self.last_recv_index = last_recv_index
 
     def to_dict(self):
         return {
@@ -59,16 +72,56 @@ class AppendEntriesResponse(Rpc):
         }
 
 
+class ProposeRequest(Rpc):
+    def __init__(self, client_id, item):
+        self.client_id = client_id
+        self.item = item
+
+
+class ProposeResponse(Rpc):
+    def __init__(self, client_id, redirect_node_id, error):
+        self.client_id = client_id
+        self.redirect_node_id = redirect_node_id
+        self.error = error
+
+    @classmethod
+    def gen_success_resp(cls, client_id):
+        # leader
+        return ProposeResponse(client_id, None, None)
+
+    @classmethod
+    def gen_redirect_resp(cls, client_id, redirect_node_id):
+        # follower
+        return ProposeResponse(client_id, redirect_node_id, None)
+
+    @classmethod
+    def gen_error_resp(cls, client_id, error):
+        # candidate
+        return ProposeResponse(client_id, None, error)
+
+
+NO_OP_ITERM = 'no-op-item'
+
+
+class LogEntry(object):
+    def __init__(self, term, log_index, item):
+        self.term = term
+        self.log_index = log_index
+        self.item = item
+
+
 class Timer(object):
-    def __init__(self, callback, timeout):
+    def __init__(self, callback, timeout, *args):
         self.timeout = timeout
         self.callback = callback
+        self.args = args
         self.reset()
 
     def check_timeout(self):
         d = (time.time() - self.start_time) * 1000
         if d > self.timeout:
-            self.callback()
+            self.start_time += (self.timeout / 1000)
+            self.callback(*self.args)
 
     def reset(self):
         self.start_time = time.time()
@@ -83,8 +136,14 @@ class ElectionTimer(Timer):
         super(ElectionTimer, self).reset()
 
 
+class VariableTimer(Timer):
+    def change_timeout(self, timeout):
+        self.timeout = timeout
+        self.check_timeout()
+
+
 class State(object):
-    def __init__(self, handler, term):
+    def __init__(self, handler, term, kvstorage=None):
         # self.handler.state will be changed by this object
         self.handler = handler
 
@@ -97,6 +156,14 @@ class State(object):
         self.timers = []
         self.send_queue = []  # (node, Rpc)
         self.recv_queue = []  # Rpc
+        self.client_resp_queue = []  # (client_id, Rpc)
+
+        # log replication
+        self.logs = [LogEntry(-1, -1, None), LogEntry(0, 0, None)]
+        self.commit_index = 0
+        self.last_applied = 0
+        # storage
+        self.kvstorage = kvstorage or {}
 
     def to_dict(self):
         return {
@@ -121,12 +188,23 @@ class State(object):
         return self.send_queue.pop(0)
 
     # call by outer object
+    def pop_client_queue(self):
+        if len(self.client_resp_queue) == 0:
+            return None, None
+        return self.client_resp_queue.pop(0)
+
+    # call by outer object
     def tick(self):
         while len(self.recv_queue):
             rpc = self.recv_queue.pop(0)
             response = self.handle_rpc(rpc)
-            self.send_queue.append((rpc.node_id, response))
+            if response is not None:
+                self.send_queue.append((rpc.node_id, response))
+        self.state_tick()
         self.cron()
+
+    def state_tick(self):
+        pass
 
     def cron(self):
         for t in self.timers:
@@ -141,6 +219,8 @@ class State(object):
             return self.request_vote_response_handler(rpc)
         elif isinstance(rpc, AppendEntriesResponse):
             return self.append_entries_response_handler(rpc)
+        elif isinstance(rpc, ProposeResponse):
+            return self.propose_request_handler(rpc)
         else:
             raise Exception('Invalid rpc')
 
@@ -153,7 +233,8 @@ class State(object):
     def change_state(self, new_state_class):
         current_state = type(self).__name__
         new_state = new_state_class.__name__
-        self.handler.state = new_state_class(self.handler, self.current_term)
+        self.handler.state = new_state_class(self.handler, self.current_term,
+                                             self.kvstorage)
         self.info('changed {}({}) to {}({})'.format(
             current_state, self.current_term,
             new_state, self.handler.state.current_term))
@@ -170,6 +251,9 @@ class State(object):
 
     def append_entries_response_handler(self, rpc):
         self.error('rpc not handled: {}'.format(rpc.to_dict()))
+
+    def propose_request_handler(self, propose):
+        raise NotImplementedError
 
     def change_to_candidate(self):
         return self.change_state(CandidateState)
@@ -198,19 +282,43 @@ class LeaderState(State):
     def __init__(self, server, term):
         super(LeaderState, self).__init__(server, term)
         self.leader_id = self.node_id
-        self.timers = [
-            Timer(self.broadcast_heartbeat, HEART_BEAT_INTERVAL)]
+
+        # Log Replication
+        self.next_index = {nid: self.logs[-1].log_index + 1 \
+            for nid in self.node_table.keys()}
+        self.match_index = {nid: 0 for nid in self.node_table.keys()}
+
+        self.client_map = {}  # log_index => client_id
+
+        # self.timers = [
+            # Timer(self.broadcast_heartbeat, IDLE_HEART_BEAT_INTERVAL)]
+        self.slave_timers = {
+            nid: VariableTimer(self.send_heartbeat,
+                               IDLE_HEART_BEAT_INTERVAL,
+                               nid) \
+                for nid in self.node_table.keys() if nid != self.node_id
+        }
         self.broadcast_heartbeat()
 
     def broadcast_heartbeat(self):
-        heartbeat = AppendEntries(self.current_term, self.node_id)
+        # heartbeat = AppendEntries(self.current_term, self.node_id)
         for node_id, node in self.node_table.iteritems():
             if node_id == self.node_id:
                 continue
-            self.debug('sending heartbeat to {}'.format(node_id))
-            # self.server.send_rpc(node, heartbeat)
-            self.send_queue.append((node_id, heartbeat))
-        self.timers[0].reset()
+            self.send_heartbeat(node_id)
+            # self.debug('sending heartbeat to {}'.format(node_id))
+            # self.send_queue.append((node_id, heartbeat))
+        # self.timers[0].reset()
+
+    def send_heartbeat(self, slave_id):
+        start_index = self.next_index[slave_id]
+        prev_log_index = self.logs[start_index - 1].log_index
+        prev_log_term = self.logs[start_index - 1].term
+        entries = [l.item for l in self.logs[start_index + 2:]]
+        heartbeat = AppendEntries(self.current_term, self.node_id,
+            prev_log_index, prev_log_term, entries, self.commit_index)
+        self.debug('sending heartbeat to {}'.format(slave_id))
+        self.send_queue.append((slave_id, heartbeat))
 
     def append_entries_handler(self, rpc):
         if rpc.term > self.current_term:
@@ -250,6 +358,61 @@ class LeaderState(State):
         else:
             self.debug('heartbeat success')
 
+        node_id = response.node_id
+        if response.success:
+            self.next_index[node_id] = response.last_recv_index + 1
+            self.match_index[node_id] = response.last_recv_index
+            last_log_index = self.logs[-1].log_index
+            if last_log_index + 1 == self.next_index[node_id]:
+                self.slave_timers[node_id].change_timeout(IDLE_HEART_BEAT_INTERVAL)
+        else:
+            self.next_index[node_id] -= 1
+            self.send_heartbeat(node_id)
+
+    def propose_request_handler(self, propose):
+        self.logs.append(LogEntry(self.current_term,
+                                 self.logs[-1].log_index + 1,
+                                 propose.item))
+        last_log_index = self.logs[-1].log_index
+        self.client_map[last_log_index] = propose.client_id
+
+    def state_tick(self):
+        last_log_index = self.logs[-1].log_index
+        for nid in self.slave_timers.keys():
+            assert last_log_index + 1 >= self.next_index[nid]
+            if last_log_index + 1 == self.next_index[nid]:
+                continue
+            assert last_log_index + 1 > self.next_index[nid]
+            assert last_log_index >= self.next_index[nid]
+            self.debug('sending proposol with heartbeat')
+            self.send_heartbeat(nid)
+            self.slave_timers[nid].change_timeout(PROPOSE_HEART_BEAT_INTERVAL)
+        self.check_success_proposol()
+
+    def cron(self):
+        for timer in self.slave_timers.values():
+            timer.check_timeout()
+
+    def check_success_proposol(self):
+        last_log_index = self.logs[-1].log_index
+        for i in range(self.commit_index + 1, last_log_index + 1):
+            count = len(map(lambda mi: mi >= i, self.match_index.values()))
+            if count <= len(self.node_table) / 2:
+                break
+            self.respond_proposol(i)
+
+    def apply_state_machine(self, log):
+        cmd = log.item
+        assert cmd[0].upper() == 'SET'
+        key, value = cmd[1:]
+        self.kvstorage[key] = value
+        self.commit_index = log.log_index
+
+    def respond_proposol(self, log_index):
+        client_id = self.client_map.pop(log_index)
+        rpc = ProposeResponse.gen_success_resp(client_id)
+        self.client_resp_queue.append(rpc)
+
 
 class FollowerState(State):
     def __init__(self, server, term):
@@ -285,6 +448,9 @@ class FollowerState(State):
                 rpc.candidate_id))
         return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
+    def propose_request_handler(self, propose):
+        pass
+
 
 class CandidateState(State):
     def __init__(self, server, term):
@@ -304,7 +470,6 @@ class CandidateState(State):
         for node_id, node in self.node_table.iteritems():
             if node_id == self.node_id:
                 continue
-            # self.server.send_rpc(node, request_vote)
             self.send_queue.append((node_id, request_vote))
         self.timers[1].reset()
 
@@ -345,3 +510,6 @@ class CandidateState(State):
             self.update_term_if_needed(response)
             self.change_to_follower()
             # then wait for leader's heartbeat
+
+    def propose_request_handler(self, propose):
+        pass
