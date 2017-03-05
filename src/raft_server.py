@@ -195,7 +195,7 @@ class RaftServer(object):
         data = self.state.kvstorage
         lines = ''
         for k, v in data.iteritems():
-            lines += '{}:{}'.format(k, v)
+            lines += '{}:{}\n'.format(k, v)
         proto_handler.send_data(lines)
 
     def handle_set_request(self, cmd, client_id, proto_handler):
@@ -209,7 +209,7 @@ class RaftServer(object):
             proto_handler.send_err(propose_response.error)
         elif propose_response.redirect_node_id:
             node = self.node_table[propose_response.redirect_node_id]
-            addr = '{host}:{port}'.format(node)
+            addr = '{host}:{port}'.format(**node)
             proto_handler.send_err('MOVED {}'.format(addr))
         else:
             proto_handler.send_ok()

@@ -301,6 +301,7 @@ class State(object):
             return
 
         if len(entries) == 0:
+            self.apply_commit(leader_commit)
             return prev_log_index
 
         i += 1
@@ -321,10 +322,25 @@ class State(object):
             self.logs.pop()
         for entry in entries:
             self.logs.append(entry)
+        self.apply_commit(leader_commit)
+        last_log_index = self.logs[-1].log_index
+        return last_log_index
+
+    def apply_commit(self, leader_commit):
         last_log_index = self.logs[-1].log_index
         if leader_commit > self.commit_index:
+            last_commit = self.commit_index
             self.commit_index = min(leader_commit, last_log_index)
-        return last_log_index
+            for i in range(last_commit + 1, self.commit_index + 1):
+                self.apply_state_machine(
+                    self.logs[self.get_index_by_log_index(i)])
+
+    def apply_state_machine(self, log):
+        cmd = log.item
+        assert cmd[0].upper() == 'SET'
+        key, value = cmd[1:]
+        self.debug('SET {} {}'.format(key, value))
+        self.kvstorage[key] = value
 
     def get_index_by_log_index(self, log_index):
         return log_index - self.logs[0].log_index
@@ -464,14 +480,7 @@ class LeaderState(State):
             log = self.logs[self.get_index_by_log_index(i)]
             assert log is not None
             self.apply_state_machine(log)
-
-    def apply_state_machine(self, log):
-        cmd = log.item
-        assert cmd[0].upper() == 'SET'
-        key, value = cmd[1:]
-        self.debug('SET {} {}'.format(key, value))
-        self.kvstorage[key] = value
-        self.commit_index = log.log_index
+            self.commit_index = log.log_index
 
     def respond_proposol(self, log_index):
         client_id = self.client_map.pop(log_index)
@@ -520,7 +529,9 @@ class FollowerState(State):
         return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def propose_request_handler(self, propose):
-        pass
+        client_id = propose.client_id
+        rpc = ProposeResponse.gen_redirect_resp(client_id, self.leader_id)
+        self.client_resp_queue.append((client_id, rpc))
 
 
 class CandidateState(State):
@@ -586,4 +597,6 @@ class CandidateState(State):
             # then wait for leader's heartbeat
 
     def propose_request_handler(self, propose):
-        pass
+        client_id = propose.client_id
+        rpc = ProposeResponse.gen_error_resp(client_id, 'No Leader')
+        self.client_resp_queue.append((client_id, rpc))

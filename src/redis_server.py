@@ -1,3 +1,4 @@
+import time
 import socket
 import logging
 import StringIO
@@ -88,12 +89,18 @@ class RedisProtocolServer(object):
     def handle_conn(self, socket, address):
         addr = '{}:{}'.format(*address)
         proto_handler = RedisProtocolHandler(socket, self.cmd_handler)
+        timeout = 5
+        start = time.time()
         while True:
-            data = socket.recv(10)
+            # TODO: handler connection error
+            data = socket.recv(1000)
+            if time.time() - start > timeout:
+                break
             if not data and proto_handler.response_sent:
                 break
             if not data:
                 continue
+            start = time.time()
             proto_handler.handle_read(addr, data)
         socket.close()
 
