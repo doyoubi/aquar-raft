@@ -7,7 +7,7 @@ import redis
 import config
 from state import (FollowerState, RequestVote, AppendEntries,
     RequestVoteResponse, AppendEntriesResponse, ProposeRequest,
-    ProposeResponse, LogEntry)
+    ProposeResponse, LogEntry, QueryRequest, QueryResponse)
 
 
 logger = logging.getLogger(__name__)
@@ -28,8 +28,10 @@ RESPONSEVOTE src_node_id term vote_granted
 RESPONSEAPPEND src_node_id term success last_recv_index
 
 Outer commands:
-INFO
+AQUAR RAFT INFO
 DUMP
+SET <key> <value>
+GET <key>
 '''
 
 
@@ -157,6 +159,9 @@ class RaftServer(object):
         elif cmd[0].lower() == 'set':
             self.add_unfinished_client(address, proto_handler)
             self.handle_set_request(cmd, address, proto_handler)
+        elif cmd[0].lower() == 'get':
+            self.add_unfinished_client(address, proto_handler)
+            self.handle_get_request(cmd, address, proto_handler)
         elif cmd[0].lower() == 'dump':
             self.handle_dump_request(proto_handler)
         else:
@@ -218,6 +223,26 @@ class RaftServer(object):
         else:
             proto_handler.send_ok()
 
+    def handle_get_request(self, cmd, client_id, proto_handler):
+        if len(cmd) != 2:
+            raise InvalidCmd(cmd)
+        rpc = QueryRequest(client_id, cmd)
+        self.state.append_recv_queue(rpc)
+
+    def handle_get_response(self, proto_handler, query_response):
+        if query_response.error:
+            proto_handler.send_err(query_response.error)
+        elif query_response.redirect_node_id:
+            node = self.node_table[query_response.redirect_node_id]
+            addr = '{host}:{port}'.format(**node)
+            proto_handler.send_err('MOVED {}'.format(addr))
+        elif query_response.not_available:
+            proto_handler.send_err('LEADER NOT READY')
+        elif query_response.result is None:
+            proto_handler.send_null_bulk_str()
+        else:
+            proto_handler.send_data(query_response.result)
+
     def loop(self):
         while True:
             self.cron()
@@ -231,6 +256,8 @@ class RaftServer(object):
             proto_handler = self.client_map[client_id]
             if isinstance(rpc, ProposeResponse):
                 self.handle_set_response(proto_handler, rpc)
+            elif isinstance(rpc, QueryResponse):
+                self.handle_get_response(proto_handler, rpc)
             else:
                 raise ServerError('unexpected response: {}'.format(rpc))
             self.remove_unfinished_client(client_id)

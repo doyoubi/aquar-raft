@@ -135,6 +135,9 @@ class RedisProtocolHandler(object):
         err = '-{}\r\n'.format(err)
         self.send(err)
 
+    def send_null_bulk_str(self):
+        self.send('$-1\r\n')
+
     def send(self, data):
         self.socket.sendall(data)
 

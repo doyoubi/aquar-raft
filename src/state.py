@@ -7,6 +7,7 @@ from .config import (
     ELECTION_TIMEOUT_RANGE,
     IDLE_HEART_BEAT_INTERVAL,
     PROPOSE_HEART_BEAT_INTERVAL,
+    QUERY_HEART_BEAT_INTERVAL,
     BROADCAST_REQUEST_VOTE_INTERVAL,
 )
 
@@ -89,17 +90,53 @@ class ProposeResponse(Rpc):
     @classmethod
     def gen_success_resp(cls, client_id):
         # leader
-        return ProposeResponse(client_id, None, None)
+        return cls(client_id, None, None)
 
     @classmethod
     def gen_redirect_resp(cls, client_id, redirect_node_id):
         # follower
-        return ProposeResponse(client_id, redirect_node_id, None)
+        return cls(client_id, redirect_node_id, None)
 
     @classmethod
     def gen_error_resp(cls, client_id, error):
         # candidate
-        return ProposeResponse(client_id, None, error)
+        return cls(client_id, None, error)
+
+
+class QueryRequest(Rpc):
+    def __init__(self, client_id, item):
+        self.client_id = client_id
+        self.item = item
+
+
+class QueryResponse(Rpc):
+    def __init__(self, client_id, redirect_node_id, error, result):
+        self.client_id = client_id
+        self.redirect_node_id = redirect_node_id
+        self.error = error
+        self.result = result
+        self.not_available = False
+
+    @classmethod
+    def gen_success_resp(cls, client_id, result):
+        # leader
+        return cls(client_id, None, None, result)
+
+    @classmethod
+    def gen_not_available(cls, client_id):
+        res = cls(client_id, None, None, None)
+        res.not_available = True
+        return res
+
+    @classmethod
+    def gen_redirect_resp(cls, client_id, redirect_node_id):
+        # follower
+        return cls(client_id, redirect_node_id, None, None)
+
+    @classmethod
+    def gen_error_resp(cls, client_id, error):
+        # candidate
+        return cls(client_id, None, error, None)
 
 
 NO_OP_ITEM = 'no-op-item'
@@ -235,6 +272,8 @@ class State(object):
             return self.append_entries_response_handler(rpc)
         elif isinstance(rpc, ProposeRequest):
             return self.propose_request_handler(rpc)
+        elif isinstance(rpc, QueryRequest):
+            return self.query_request_handler(rpc)
         else:
             raise Exception('Invalid rpc')
 
@@ -268,6 +307,9 @@ class State(object):
         self.error('rpc not handled: {}'.format(rpc.to_dict()))
 
     def propose_request_handler(self, propose):
+        raise NotImplementedError
+
+    def query_request_handler(self, query):
         raise NotImplementedError
 
     def change_to_candidate(self):
@@ -380,7 +422,10 @@ class LeaderState(State):
             for nid in self.node_table.keys()}
         self.match_index = {nid: 0 for nid in self.node_table.keys()}
 
+        self.slave_ids = [nid for nid in self.node_table.keys() if nid != self.node_id]
         self.client_map = {}  # log_index => client_id
+        self.query_queue = []
+        self.query_heart_beat_tags = {sid: False for sid in self.slave_ids}
 
         # no-op item
         self.no_op_committed = False
@@ -390,7 +435,7 @@ class LeaderState(State):
             nid: VariableTimer(self.send_heartbeat,
                                IDLE_HEART_BEAT_INTERVAL,
                                nid) \
-                for nid in self.node_table.keys() if nid != self.node_id
+                for nid in self.slave_ids
         }
         self.broadcast_heartbeat()
 
@@ -458,6 +503,7 @@ class LeaderState(State):
                 self.current_term, response.term))
             self.update_term_if_needed(response)
             self.change_to_follower()
+            return
 
         node_id = response.node_id
         if response.success:
@@ -472,6 +518,8 @@ class LeaderState(State):
             self.next_index[node_id] -= 1
             self.send_heartbeat(node_id)
             self.slave_timers[node_id].reset()
+
+        self.tag_query_heart_beat(node_id)
 
     def propose_request_handler(self, propose):
         self.logs.append(LogEntry(self.current_term,
@@ -497,6 +545,7 @@ class LeaderState(State):
             self.send_heartbeat(nid)
             self.slave_timers[nid].reset()
             self.slave_timers[nid].change_timeout(PROPOSE_HEART_BEAT_INTERVAL)
+        self.check_success_query()
         self.check_success_proposol()
 
     def cron(self):
@@ -523,6 +572,56 @@ class LeaderState(State):
         client_id = self.client_map.pop(log_index)
         rpc = ProposeResponse.gen_success_resp(client_id)
         self.client_resp_queue.append((client_id, rpc))
+
+    def query_request_handler(self, query):
+        if not self.no_op_committed:
+            self.respond_not_avalible(query)
+            return
+        if len(self.query_queue) == 0:
+            self.clear_query_heart_beat_tags()
+        self.query_queue.append(query)
+        for nid in self.slave_ids:
+            self.send_heartbeat(nid)
+            self.slave_timers[nid].reset()
+            self.slave_timers[nid].change_timeout(QUERY_HEART_BEAT_INTERVAL)
+
+    def check_success_query(self):
+        if len(self.query_queue) == 0:
+            return
+        count = len(filter(None, self.query_heart_beat_tags.values()))
+        if count <= len(self.node_table) / 2:
+            return
+        for q in self.query_queue:
+            self.respond_query(q)
+        self.query_queue = []
+        self.clear_query_heart_beat_tags()
+        for nid in self.slave_ids:
+            if self.slave_timers[nid].timeout == QUERY_HEART_BEAT_INTERVAL:
+                self.slave_timers[nid].change_timeout(IDLE_HEART_BEAT_INTERVAL)
+
+    def tag_query_heart_beat(self, slave_id):
+        if len(self.query_queue) == 0:
+            return
+        self.query_heart_beat_tags[slave_id] = True
+
+    def clear_query_heart_beat_tags(self):
+        for sid in self.slave_ids:
+            self.query_heart_beat_tags[sid] = False
+
+    def respond_query(self, query):
+        client_id = query.client_id
+        cmd = query.item
+        assert cmd[0].upper() == 'GET'
+        key = cmd[1]
+        value = self.kvstorage.get(key)
+        rpc = QueryResponse.gen_success_resp(client_id, value)
+        self.client_resp_queue.append((client_id, rpc))
+
+    def respond_not_avalible(self, query):
+        client_id = query.client_id
+        rpc = QueryResponse.gen_not_available(client_id)
+        self.client_resp_queue.append((client_id, rpc))
+
 
 
 class FollowerState(State):
@@ -569,6 +668,11 @@ class FollowerState(State):
     def propose_request_handler(self, propose):
         client_id = propose.client_id
         rpc = ProposeResponse.gen_redirect_resp(client_id, self.leader_id)
+        self.client_resp_queue.append((client_id, rpc))
+
+    def query_request_handler(self, query):
+        client_id = query.client_id
+        rpc = QueryResponse.gen_redirect_resp(client_id, self.leader_id)
         self.client_resp_queue.append((client_id, rpc))
 
 
@@ -640,4 +744,9 @@ class CandidateState(State):
     def propose_request_handler(self, propose):
         client_id = propose.client_id
         rpc = ProposeResponse.gen_error_resp(client_id, 'No Leader')
+        self.client_resp_queue.append((client_id, rpc))
+
+    def query_request_handler(self, query):
+        client_id = query.client_id
+        rpc = QueryResponse.gen_error_resp(client_id, 'No Leader')
         self.client_resp_queue.append((client_id, rpc))
