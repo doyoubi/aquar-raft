@@ -102,7 +102,7 @@ class ProposeResponse(Rpc):
         return ProposeResponse(client_id, None, error)
 
 
-NO_OP_ITERM = 'no-op-item'
+NO_OP_ITEM = 'no-op-item'
 
 
 class LogEntry(object):
@@ -339,6 +339,8 @@ class State(object):
 
     def apply_state_machine(self, log):
         cmd = log.item
+        if cmd == NO_OP_ITEM:
+            return
         assert cmd[0].upper() == 'SET'
         key, value = cmd[1:]
         self.debug('SET {} {}'.format(key, value))
@@ -380,6 +382,10 @@ class LeaderState(State):
 
         self.client_map = {}  # log_index => client_id
 
+        # no-op item
+        self.no_op_committed = False
+        self.no_op_index = self.add_no_op()
+
         self.slave_timers = {
             nid: VariableTimer(self.send_heartbeat,
                                IDLE_HEART_BEAT_INTERVAL,
@@ -405,6 +411,12 @@ class LeaderState(State):
             prev_log_index, prev_log_term, self.commit_index, entries)
         self.debug('sending heartbeat to {}'.format(slave_id))
         self.send_queue.append((slave_id, heartbeat))
+
+    def add_no_op(self):
+        self.logs.append(LogEntry(self.current_term,
+                                  self.logs[-1].log_index + 1,
+                                  NO_OP_ITEM))
+        return self.logs[-1].log_index
 
     def append_entries_handler(self, rpc):
         if rpc.term > self.current_term:
@@ -503,6 +515,9 @@ class LeaderState(State):
             assert log is not None
             self.apply_state_machine(log)
             self.commit_index = log.log_index
+
+            if i == self.no_op_index:
+                self.no_op_committed = True
 
     def respond_proposol(self, log_index):
         client_id = self.client_map.pop(log_index)
