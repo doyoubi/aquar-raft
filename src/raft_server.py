@@ -1,11 +1,13 @@
 import logging
+import json
 
 import gevent
 import redis
 
 import config
 from state import (FollowerState, RequestVote, AppendEntries,
-    RequestVoteResponse, AppendEntriesResponse)
+    RequestVoteResponse, AppendEntriesResponse, ProposeRequest,
+    ProposeResponse, LogEntry, QueryRequest, QueryResponse)
 
 
 logger = logging.getLogger(__name__)
@@ -20,13 +22,16 @@ INFO = 'INFO'
 
 ''' Command
 Inner commands:
-REQUESTVOTE term candidate_id
-APPENDENTRY term leader_id
+REQUESTVOTE term candidate_id last_log_index last_log_term
+APPENDENTRY term leader_id prev_log_index prev_log_term leader_commit [entries...]
 RESPONSEVOTE src_node_id term vote_granted
-RESPONSEAPPEND src_node_id term success
+RESPONSEAPPEND src_node_id term success last_recv_index
 
 Outer commands:
-INFO
+AQUAR RAFT INFO
+DUMP
+SET <key> <value>
+GET <key>
 '''
 
 
@@ -38,21 +43,32 @@ class InvalidCmd(Exception):
         return 'InvalidCmd<{}>'.format(' '.join(self.cmd))
 
 
+class ServerError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+
 def encode_request_vote(request_vote):
-    return '{} {} {} {}'.format(
+    return '{} {} {} {} {} {}'.format(
         CMD_PREFIX,
         REQUESTVOTE,
         request_vote.term,
-        request_vote.candidate_id
+        request_vote.candidate_id,
+        request_vote.last_log_index,
+        request_vote.last_log_term,
     )
 
 
 def encode_append_entries(append_entries):
-    return '{} {} {} {}'.format(
+    return '{} {} {} {} {} {} {} {}'.format(
         CMD_PREFIX,
         APPENDENTRY,
         append_entries.term,
-        append_entries.leader_id
+        append_entries.leader_id,
+        append_entries.prev_log_index,
+        append_entries.prev_log_term,
+        append_entries.leader_commit,
+        json.dumps(append_entries.entries).replace(' ', ''),
     )
 
 
@@ -67,25 +83,33 @@ def encode_request_vote_response(request_vote_response):
 
 
 def encode_append_entries_response(append_entries_response):
-    return '{} {} {} {} {}'.format(
+    return '{} {} {} {} {} {}'.format(
         CMD_PREFIX,
         RESPONSEAPPEND,
         append_entries_response.node_id,
         append_entries_response.term,
-        1 if append_entries_response.success else 0
+        1 if append_entries_response.success else 0,
+        append_entries_response.last_recv_index
     )
 
 
 def decode_request_vote(redis_response):
     term = int(redis_response[0])
     candidate_id = redis_response[1]
-    return RequestVote(term, candidate_id)
+    last_log_index = int(redis_response[2])
+    last_log_term = int(redis_response[3])
+    return RequestVote(term, candidate_id, last_log_index, last_log_term)
 
 
 def decode_append_entries(redis_response):
     term = int(redis_response[0])
     leader_id = redis_response[1]
-    return AppendEntries(term, leader_id)
+    prev_log_index = int(redis_response[2])
+    prev_log_term = int(redis_response[3])
+    leader_commit = int(redis_response[4])
+    entries = [LogEntry(**e) for e in json.loads(redis_response[5])]
+    return AppendEntries(term, leader_id,
+        prev_log_index, prev_log_term, leader_commit, entries)
 
 
 def decode_request_vote_response(redis_response):
@@ -99,7 +123,11 @@ def decode_append_entries_response(redis_response):
     node_id = redis_response[0]
     term = int(redis_response[1])
     success = int(redis_response[2]) != 0
-    return AppendEntriesResponse(node_id, term, success)
+    if redis_response[3] != 'None':
+        last_recv_index = int(redis_response[3])
+    else:
+        last_recv_index = None
+    return AppendEntriesResponse(node_id, term, success, last_recv_index)
 
 
 class RaftServer(object):
@@ -115,20 +143,37 @@ class RaftServer(object):
         self.node_id = node_id
         self.node_table = shard['nodes']
         self.state = FollowerState(self, shard['term'])
+        self.client_map = {}
 
     def handle_cmd(self, address, cmd, proto_handler):
-        logger.info('recv from {}: {}'.format(address, ' '.join(cmd)))
+        logger.info('recv from {}: {}'.format(address, repr(' '.join(cmd))))
         try:
-            self.dispatch_cmd(cmd, proto_handler)
+            self.dispatch_cmd(address, cmd, proto_handler)
         except InvalidCmd as e:
             logger.error(e)
             proto_handler.send_err('Invalid command')
 
-    def dispatch_cmd(self, cmd, proto_handler):
+    def dispatch_cmd(self, address, cmd, proto_handler):
         if cmd[0].lower() == 'aquar' and cmd[1].lower() == 'raft':
             self.handle_aquar_raft(cmd[2:], proto_handler)
+        elif cmd[0].lower() == 'set':
+            self.add_unfinished_client(address, proto_handler)
+            self.handle_set_request(cmd, address, proto_handler)
+        elif cmd[0].lower() == 'get':
+            self.add_unfinished_client(address, proto_handler)
+            self.handle_get_request(cmd, address, proto_handler)
+        elif cmd[0].lower() == 'dump':
+            self.handle_dump_request(proto_handler)
         else:
             raise InvalidCmd(cmd)
+
+    def add_unfinished_client(self, client_id, proto_handler):
+        proto_handler.response_sent = False
+        self.client_map[client_id] = proto_handler
+
+    def remove_unfinished_client(self, client_id):
+        proto_handler = self.client_map.pop(client_id)
+        proto_handler.response_sent = True
 
     def handle_aquar_raft(self, cmd, proto_handler):
         subcmd = cmd[0].upper()
@@ -153,14 +198,70 @@ class RaftServer(object):
             return
         else:
             raise InvalidCmd(cmd)
-        proto_handler.send('+OK\r\n')
+        proto_handler.send_ok()
+
+    def handle_dump_request(self, proto_handler):
+        data = self.state.kvstorage
+        lines = ''
+        for k, v in data.iteritems():
+            lines += '{}:{}\n'.format(k, v)
+        proto_handler.send_data(lines)
+
+    def handle_set_request(self, cmd, client_id, proto_handler):
+        if len(cmd) != 3:
+            raise InvalidCmd(cmd)
+        rpc = ProposeRequest(client_id, cmd)
+        self.state.append_recv_queue(rpc)
+
+    def handle_set_response(self, proto_handler, propose_response):
+        if propose_response.error:
+            proto_handler.send_err(propose_response.error)
+        elif propose_response.redirect_node_id:
+            node = self.node_table[propose_response.redirect_node_id]
+            addr = '{host}:{port}'.format(**node)
+            proto_handler.send_err('MOVED {}'.format(addr))
+        else:
+            proto_handler.send_ok()
+
+    def handle_get_request(self, cmd, client_id, proto_handler):
+        if len(cmd) != 2:
+            raise InvalidCmd(cmd)
+        rpc = QueryRequest(client_id, cmd)
+        self.state.append_recv_queue(rpc)
+
+    def handle_get_response(self, proto_handler, query_response):
+        if query_response.error:
+            proto_handler.send_err(query_response.error)
+        elif query_response.redirect_node_id:
+            node = self.node_table[query_response.redirect_node_id]
+            addr = '{host}:{port}'.format(**node)
+            proto_handler.send_err('MOVED {}'.format(addr))
+        elif query_response.not_available:
+            proto_handler.send_err('LEADER NOT READY')
+        elif query_response.result is None:
+            proto_handler.send_null_bulk_str()
+        else:
+            proto_handler.send_data(query_response.result)
 
     def loop(self):
         while True:
             self.cron()
-            gevent.sleep(config.RAFT_TICK_INTERVAL / 1000)
+            gevent.sleep(float(config.RAFT_TICK_INTERVAL) / 1000)
 
     def cron(self):
+        while True:
+            client_id, rpc = self.state.pop_client_queue()
+            if rpc is None:
+                break
+            proto_handler = self.client_map[client_id]
+            if isinstance(rpc, ProposeResponse):
+                self.handle_set_response(proto_handler, rpc)
+            elif isinstance(rpc, QueryResponse):
+                self.handle_get_response(proto_handler, rpc)
+            else:
+                raise ServerError('unexpected response: {}'.format(rpc))
+            self.remove_unfinished_client(client_id)
+
         self.state.tick()
         while True:
             node_id, rpc = self.state.pop_send_queue()

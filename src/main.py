@@ -11,9 +11,13 @@ from .redis_server import RedisProtocolServer
 from .raft_server import RaftServer
 
 
+ch = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter('%(asctime)s.%(msecs)03d [%(process)s]: %(message)s',
+                              datefmt='%m/%d/%Y %I:%M:%S')
+ch.setFormatter(formatter)
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.addHandler(ch)
 
 
 def simple_handler(cmd, proto_handler):
