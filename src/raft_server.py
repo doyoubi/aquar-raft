@@ -22,7 +22,7 @@ INFO = 'INFO'
 
 ''' Command
 Inner commands:
-REQUESTVOTE term candidate_id
+REQUESTVOTE term candidate_id last_log_index last_log_term
 APPENDENTRY term leader_id prev_log_index prev_log_term leader_commit [entries...]
 RESPONSEVOTE src_node_id term vote_granted
 RESPONSEAPPEND src_node_id term success last_recv_index
@@ -47,11 +47,13 @@ class ServerError(Exception):
 
 
 def encode_request_vote(request_vote):
-    return '{} {} {} {}'.format(
+    return '{} {} {} {} {} {}'.format(
         CMD_PREFIX,
         REQUESTVOTE,
         request_vote.term,
-        request_vote.candidate_id
+        request_vote.candidate_id,
+        request_vote.last_log_index,
+        request_vote.last_log_term,
     )
 
 
@@ -92,7 +94,9 @@ def encode_append_entries_response(append_entries_response):
 def decode_request_vote(redis_response):
     term = int(redis_response[0])
     candidate_id = redis_response[1]
-    return RequestVote(term, candidate_id)
+    last_log_index = int(redis_response[2])
+    last_log_term = int(redis_response[3])
+    return RequestVote(term, candidate_id, last_log_index, last_log_term)
 
 
 def decode_append_entries(redis_response):

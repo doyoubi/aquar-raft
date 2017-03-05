@@ -25,10 +25,12 @@ class InnerRpc(Rpc):
 
 
 class RequestVote(InnerRpc):
-    def __init__(self, term, candidate_id):
+    def __init__(self, term, candidate_id, last_log_index, last_log_term):
         super(RequestVote, self).__init__(term)
         self.candidate_id = candidate_id
         self.node_id = candidate_id
+        self.last_log_index = last_log_index
+        self.last_log_term = last_log_term
 
 
 class AppendEntries(InnerRpc):
@@ -345,6 +347,26 @@ class State(object):
     def get_index_by_log_index(self, log_index):
         return log_index - self.logs[0].log_index
 
+    def cmp_log(self, request_vote):
+        ''' return:
+            1 for we are more up-to-date
+            0 for equal
+            -1 for we are out-of-date
+        '''
+        last_log_term = request_vote.last_log_term
+        last_log_index = request_vote.last_log_index
+        if self.current_term > last_log_term:
+            return 1
+        elif self.current_term < last_log_term:
+            return -1
+        my_last_index = self.logs[-1].log_index
+        if my_last_index > last_log_index:
+            return 1
+        elif my_last_index < last_log_index:
+            return -1
+        else:
+            return 0
+
 
 class LeaderState(State):
     def __init__(self, handler, term, logs=None, kvstorage=None):
@@ -408,7 +430,7 @@ class LeaderState(State):
                 'Invalid state, leader receive heartbeat from same term')
 
     def request_vote_handler(self, rpc):
-        vote_granted = rpc.term > self.current_term
+        vote_granted = rpc.term > self.current_term and self.cmp_log(rpc) <= 0
         if vote_granted:
             self.info('vote granted to {}'.format(rpc.candidate_id))
             self.update_term_if_needed(rpc)
@@ -517,6 +539,7 @@ class FollowerState(State):
         self.info('receive request vote from {}'.format(rpc.candidate_id))
         vote_granted = rpc.term > self.current_term or \
             (rpc.term == self.current_term and self.voted_for is None)
+        vote_granted = vote_granted and self.cmp_log(rpc) <= 0
         if self.voted_for:
             self.info('already voted for {}'.format(self.voted_for))
         if vote_granted:
@@ -548,7 +571,10 @@ class CandidateState(State):
         self.broadcast_request_vote()
 
     def broadcast_request_vote(self):
-        request_vote = RequestVote(self.current_term, self.node_id)
+        last_log_index = self.logs[-1].log_index
+        last_log_term = self.logs[-1].term
+        request_vote = RequestVote(self.current_term, self.node_id,
+                                   last_log_index, last_log_term)
         for node_id, node in self.node_table.iteritems():
             if node_id == self.node_id:
                 continue
@@ -570,7 +596,7 @@ class CandidateState(State):
 
     def request_vote_handler(self, rpc):
         self.info('receive request vote from {}'.format(rpc.candidate_id))
-        vote_granted = rpc.term > self.current_term
+        vote_granted = rpc.term > self.current_term and self.cmp_log(rpc) <= 0
         if vote_granted:
             self.info('vote granted to {}'.format(rpc.candidate_id))
             self.update_term_if_needed(rpc)
