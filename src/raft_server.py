@@ -7,7 +7,7 @@ import redis
 import config
 from state import (FollowerState, RequestVote, AppendEntries,
     RequestVoteResponse, AppendEntriesResponse, ProposeRequest,
-    ProposeResponse)
+    ProposeResponse, LogEntry)
 
 
 logger = logging.getLogger(__name__)
@@ -79,12 +79,13 @@ def encode_request_vote_response(request_vote_response):
 
 
 def encode_append_entries_response(append_entries_response):
-    return '{} {} {} {} {}'.format(
+    return '{} {} {} {} {} {}'.format(
         CMD_PREFIX,
         RESPONSEAPPEND,
         append_entries_response.node_id,
         append_entries_response.term,
-        1 if append_entries_response.success else 0
+        1 if append_entries_response.success else 0,
+        append_entries_response.last_recv_index
     )
 
 
@@ -97,10 +98,10 @@ def decode_request_vote(redis_response):
 def decode_append_entries(redis_response):
     term = int(redis_response[0])
     leader_id = redis_response[1]
-    prev_log_index = redis_response[2]
-    prev_log_term = redis_response[3]
-    leader_commit = redis_response[4]
-    entries = json.loads(redis_response[5])
+    prev_log_index = int(redis_response[2])
+    prev_log_term = int(redis_response[3])
+    leader_commit = int(redis_response[4])
+    entries = [LogEntry(**e) for e in json.loads(redis_response[5])]
     return AppendEntries(term, leader_id,
         prev_log_index, prev_log_term, leader_commit, entries)
 
@@ -116,7 +117,10 @@ def decode_append_entries_response(redis_response):
     node_id = redis_response[0]
     term = int(redis_response[1])
     success = int(redis_response[2]) != 0
-    last_recv_index = int(redis_response[3])
+    if redis_response[3] != 'None':
+        last_recv_index = int(redis_response[3])
+    else:
+        last_recv_index = None
     return AppendEntriesResponse(node_id, term, success, last_recv_index)
 
 
@@ -156,7 +160,7 @@ class RaftServer(object):
 
     def add_unfinished_client(self, client_id, proto_handler):
         proto_handler.response_sent = False
-        self.client_map[client_id]
+        self.client_map[client_id] = proto_handler
 
     def remove_unfinished_client(self, client_id):
         proto_handler = self.client_map.pop(client_id)
@@ -186,17 +190,16 @@ class RaftServer(object):
         else:
             raise InvalidCmd(cmd)
         proto_handler.send_ok()
-        # proto_handler.send('+OK\r\n')
 
     def handle_dump_request(self, proto_handler):
         data = self.state.kvstorage
         lines = ''
-        for k, v in data.iteritems:
+        for k, v in data.iteritems():
             lines += '{}:{}'.format(k, v)
-        proto_handler.send(lines)
+        proto_handler.send_data(lines)
 
     def handle_set_request(self, cmd, client_id, proto_handler):
-        if len(cmd) != 2:
+        if len(cmd) != 3:
             raise InvalidCmd(cmd)
         rpc = ProposeRequest(client_id, cmd)
         self.state.append_recv_queue(rpc)
@@ -214,7 +217,7 @@ class RaftServer(object):
     def loop(self):
         while True:
             self.cron()
-            gevent.sleep(config.RAFT_TICK_INTERVAL / 1000)
+            gevent.sleep(float(config.RAFT_TICK_INTERVAL) / 1000)
 
     def cron(self):
         while True:
@@ -226,6 +229,7 @@ class RaftServer(object):
                 self.handle_set_response(proto_handler, rpc)
             else:
                 raise ServerError('unexpected response: {}'.format(rpc))
+            self.remove_unfinished_client(client_id)
 
         self.state.tick()
         while True:

@@ -12,7 +12,7 @@ from .raft_server import RaftServer
 
 
 ch = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter('%(asctime)s: %(message)s',
+formatter = logging.Formatter('%(asctime)s.%(msecs)03d [%(process)s]: %(message)s',
                               datefmt='%m/%d/%Y %I:%M:%S')
 ch.setFormatter(formatter)
 logger = logging.getLogger()
