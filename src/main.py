@@ -38,7 +38,7 @@ def serve():
     raft_server = RaftServer(node_id)
     server = StreamServer(
         ('0.0.0.0', addr['port']),
-        RedisProtocolServer(raft_server.handle_cmd).handle_conn)
+        RedisProtocolServer(raft_server).handle_conn)
     logger.info('Starting echo server on port {}'.format(addr['port']))
     server.start()
     logger.info('getting into loop')

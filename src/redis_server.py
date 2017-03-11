@@ -5,6 +5,7 @@ import StringIO
 from collections import namedtuple
 
 import redis_protocol
+import gevent
 from gevent.server import StreamServer
 
 
@@ -83,18 +84,19 @@ def parse_redis_len(buf, prefix):
 
 
 class RedisProtocolServer(object):
-    def __init__(self, cmd_handler):
-        self.cmd_handler = cmd_handler
+    def __init__(self, cmd_server):
+        self.cmd_server = cmd_server
 
-    def handle_conn(self, socket, address):
+    def handle_conn(self, conn, address):
         addr = '{}:{}'.format(*address)
-        proto_handler = RedisProtocolHandler(socket, self.cmd_handler)
+        proto_handler = RedisProtocolHandler(conn,
+                                             self.cmd_server.handle_cmd)
         timeout = 5
         start = time.time()
-        while True:
-            # TODO: handler connection error
-            data = socket.recv(1000)
+        while not proto_handler.broken:
+            data = self.read_request(conn, address, proto_handler)
             if time.time() - start > timeout:
+                logger.error('client time out')
                 break
             if not data and proto_handler.response_sent:
                 break
@@ -102,15 +104,28 @@ class RedisProtocolServer(object):
                 continue
             start = time.time()
             proto_handler.handle_read(addr, data)
-        socket.close()
+            gevent.sleep(0)  # switch
+        conn.close()
+
+    def read_request(self, conn, address, proto_handler):
+        try:
+            return conn.recv(1000)
+        except socket.error as e:
+            logger.error(e)
+            if 'Bad file descriptor' not in str(e):
+                raise
+            self.cmd_server.remove_client(address)
+            proto_handler.broken = True
+            proto_handler.response_sent = True
 
 
 class RedisProtocolHandler(object):
-    def __init__(self, socket, callback):
+    def __init__(self, conn, callback):
         self.data = ''
-        self.socket = socket
+        self.conn = conn
         self.callback = callback
         self.response_sent = True  # will be modified by outer object
+        self.broken = False
 
     def handle_read(self, address, data):
         self.data += data
@@ -139,12 +154,10 @@ class RedisProtocolHandler(object):
         self.send('$-1\r\n')
 
     def send(self, data):
-        self.socket.sendall(data)
-
-# Example:
-# def pong(address, cmd, proto_handler):
-#    proto_handler.send('+PONG\r\n')
-
-# server = StreamServer(('0.0.0.0', 7777), RedisProtocolServer(pong).handle_conn)
-# server.serve_forever()
-
+        try:
+            self.conn.sendall(data)
+        except socket.error as e:
+            logger.error(e)
+            if 'Bad file descriptor' not in str(e):
+                raise
+            self.broken = True
