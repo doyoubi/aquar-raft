@@ -155,6 +155,9 @@ class LogEntry(object):
             'item': self.item,
         }
 
+    def __repr__(self):
+        return str(self.to_dict())
+
 
 class Timer(object):
     def __init__(self, callback, timeout, *args):
@@ -189,7 +192,7 @@ class VariableTimer(Timer):
 
 
 class State(object):
-    def __init__(self, handler, term, logs=None, kvstorage=None):
+    def __init__(self, handler, term, logs=None, kvstorage=None, commit_index=None):
         # self.handler.state will be changed by this object
         self.handler = handler
 
@@ -206,7 +209,7 @@ class State(object):
 
         # log replication
         self.logs = logs or [LogEntry(-1, -1, None), LogEntry(0, 0, None)]
-        self.commit_index = 0
+        self.commit_index = commit_index or 0
         self.last_applied = 0
         # storage
         self.kvstorage = kvstorage or {}
@@ -287,7 +290,7 @@ class State(object):
         current_state = type(self).__name__
         new_state = new_state_class.__name__
         self.handler.state = new_state_class(self.handler, self.current_term,
-                                             self.logs, self.kvstorage)
+                                             self.logs, self.kvstorage, self.commit_index)
         self.info('changed {}({}) to {}({})'.format(
             current_state, self.current_term,
             new_state, self.handler.state.current_term))
@@ -339,14 +342,12 @@ class State(object):
         prev_log_term = append_entries.prev_log_term
         leader_commit = append_entries.leader_commit
         entries = append_entries.entries
+        if len(entries) > 1:
+            assert prev_log_index + 1 == entries[0].log_index
 
         i = self.get_index_by_log_index(prev_log_index)
         if i >= len(self.logs) or self.logs[i].term != prev_log_term:
             return
-
-        if len(entries) == 0:
-            self.apply_commit(leader_commit)
-            return prev_log_index
 
         i += 1
         j = 0
@@ -354,14 +355,22 @@ class State(object):
             if i >= len(self.logs) or \
                     self.logs[i].term != entry.term:
                 break
-            assert self.logs[i].log_index == entry.log_index
+            err_msg = (i, prev_log_index, self.logs[i].log_index,
+                       entry.log_index, self.logs, entries)
+            assert self.logs[i].log_index == entry.log_index, err_msg
             prev_log_index += 1
+            i += 1
             j += 1
 
         entries = entries[j:]
 
+        if len(entries) == 0:
+            self.apply_commit(leader_commit)
+            return prev_log_index
+
         while self.logs[-1].log_index > prev_log_index:
-            assert self.logs[-1].log_index > self.commit_index
+            err_msg = (self.logs[-1].log_index, self.commit_index, prev_log_index)
+            assert self.logs[-1].log_index > self.commit_index, err_msg
             assert self.logs[-1].log_index > 0
             self.logs.pop()
         for entry in entries:
@@ -372,9 +381,14 @@ class State(object):
 
     def apply_commit(self, leader_commit):
         last_log_index = self.logs[-1].log_index
+        assert leader_commit <= last_log_index
         if leader_commit > self.commit_index:
+            assert last_log_index > self.commit_index
             last_commit = self.commit_index
             self.commit_index = min(leader_commit, last_log_index)
+            self.debug('apply commit from {} to {}'.format(
+                last_commit, self.commit_index))
+            assert last_commit <= self.commit_index, (leader_commit, last_log_index)
             for i in range(last_commit + 1, self.commit_index + 1):
                 self.apply_state_machine(
                     self.logs[self.get_index_by_log_index(i)])
@@ -399,22 +413,30 @@ class State(object):
         '''
         last_log_term = request_vote.last_log_term
         last_log_index = request_vote.last_log_index
-        if self.current_term > last_log_term:
+        my_last_log = self.logs[-1]
+        if my_last_log.term > last_log_term:
             return 1
-        elif self.current_term < last_log_term:
+        elif my_last_log.term < last_log_term:
             return -1
-        my_last_index = self.logs[-1].log_index
-        if my_last_index > last_log_index:
+        if my_last_log.log_index > last_log_index:
             return 1
-        elif my_last_index < last_log_index:
+        elif my_last_log.log_index < last_log_index:
             return -1
         else:
             return 0
 
+    def log_rejection(self, rpc):
+        my_last_log = self.logs[-1]
+        self.info('rejected vote request from {}. terms: mine({}) rpc({}). ' \
+                      'log: {}-{} {}-{}'.format(
+                rpc.candidate_id, self.current_term, rpc.term,
+                my_last_log.term, my_last_log.log_index,
+                rpc.last_log_term, rpc.last_log_index))
+
 
 class LeaderState(State):
-    def __init__(self, handler, term, logs=None, kvstorage=None):
-        super(LeaderState, self).__init__(handler, term, logs, kvstorage)
+    def __init__(self, handler, term, logs=None, kvstorage=None, commit_index=None):
+        super(LeaderState, self).__init__(handler, term, logs, kvstorage, commit_index)
         self.leader_id = self.node_id
 
         # Log Replication
@@ -447,6 +469,7 @@ class LeaderState(State):
 
     def send_heartbeat(self, slave_id):
         start_index = self.next_index[slave_id]
+        assert start_index > 0
         self.debug('start_index->{}: {}'.format(slave_id, start_index))
         start_index = self.get_index_by_log_index(start_index)
         prev_log_index = self.logs[start_index - 1].log_index
@@ -493,8 +516,7 @@ class LeaderState(State):
             self.update_term_if_needed(rpc)
             self.change_to_follower()
         else:
-            self.info('rejected vote request from {}'.format(
-                rpc.candidate_id))
+            self.log_rejection(rpc)
         return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def append_entries_response_handler(self, response):
@@ -591,6 +613,7 @@ class LeaderState(State):
         count = len(filter(None, self.query_heart_beat_tags.values()))
         if count <= len(self.node_table) / 2:
             return
+        self.debug('responding batch len: {}'.format(len(self.query_queue)))
         for q in self.query_queue:
             self.respond_query(q)
         self.query_queue = []
@@ -625,8 +648,8 @@ class LeaderState(State):
 
 
 class FollowerState(State):
-    def __init__(self, handler, term, logs=None, kvstorage=None):
-        super(FollowerState, self).__init__(handler, term, logs, kvstorage)
+    def __init__(self, handler, term, logs=None, kvstorage=None, commit_index=None):
+        super(FollowerState, self).__init__(handler, term, logs, kvstorage, commit_index)
         self.timers = [ElectionTimer(self.change_to_candidate)]
 
     def append_entries_handler(self, rpc):
@@ -661,8 +684,7 @@ class FollowerState(State):
             self.update_term_if_needed(rpc)
             self.voted_for = rpc.candidate_id
         else:
-            self.info('rejected vote request from {}'.format(
-                rpc.candidate_id))
+            self.log_rejection(rpc)
         return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def propose_request_handler(self, propose):
@@ -677,8 +699,8 @@ class FollowerState(State):
 
 
 class CandidateState(State):
-    def __init__(self, handler, term, logs=None, kvstorage=None):
-        super(CandidateState, self).__init__(handler, term, logs, kvstorage)
+    def __init__(self, handler, term, logs=None, kvstorage=None, commit_index=None):
+        super(CandidateState, self).__init__(handler, term, logs, kvstorage, commit_index)
         self.current_term += 1
         self.voted_for = self.node_id
         self.votes = { self.node_id }
@@ -722,8 +744,7 @@ class CandidateState(State):
             new_state = self.change_to_follower()
             new_state.voted_for = rpc.candidate_id
         else:
-            self.info('rejected vote request from {}'.format(
-                rpc.candidate_id))
+            self.log_rejection(rpc)
         return RequestVoteResponse(self.node_id, self.current_term, vote_granted)
 
     def check_quorum(self):

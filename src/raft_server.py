@@ -145,6 +145,9 @@ class RaftServer(object):
         self.state = FollowerState(self, shard['term'])
         self.client_map = {}
 
+    def remove_client(self, client_id):
+        return self.client_map.pop(client_id)
+
     def handle_cmd(self, address, cmd, proto_handler):
         logger.info('recv from {}: {}'.format(address, repr(' '.join(cmd))))
         try:
@@ -253,7 +256,9 @@ class RaftServer(object):
             client_id, rpc = self.state.pop_client_queue()
             if rpc is None:
                 break
-            proto_handler = self.client_map[client_id]
+            proto_handler = self.client_map.get(client_id)
+            if proto_handler is None:
+                break  # connection closed
             if isinstance(rpc, ProposeResponse):
                 self.handle_set_response(proto_handler, rpc)
             elif isinstance(rpc, QueryResponse):
