@@ -36,7 +36,7 @@ class RequestVote(InnerRpc):
 
 class AppendEntries(InnerRpc):
     def __init__(self, term, leader_id,
-            prev_log_index, prev_log_term, leader_commit, entries):
+            prev_log_index, prev_log_term, leader_commit, read_index, entries):
         super(AppendEntries, self).__init__(term)
         self.leader_id = leader_id
         self.node_id = leader_id
@@ -44,6 +44,7 @@ class AppendEntries(InnerRpc):
         self.prev_log_index = prev_log_index
         self.prev_log_term = prev_log_term
         self.leader_commit = leader_commit
+        self.read_index = read_index
         self.entries = entries
 
 
@@ -61,17 +62,21 @@ class RequestVoteResponse(InnerRpc):
 
 
 class AppendEntriesResponse(InnerRpc):
-    def __init__(self, node_id, term, success, last_recv_index):
+    def __init__(self, node_id, term, success, last_recv_index, read_index):
         super(AppendEntriesResponse, self).__init__(term)
         self.success = success
         self.node_id = node_id
         # last_recv_index will be None if not success
         self.last_recv_index = last_recv_index
+        self.read_index = read_index
 
     def to_dict(self):
         return {
             'term': self.term,
             'success': self.success,
+            'node_id': self.node_id,
+            'last_recv_index': self.last_recv_index,
+            'read_index': self.read_index,
         }
 
 
@@ -369,7 +374,8 @@ class State(object):
             return prev_log_index
 
         while self.logs[-1].log_index > prev_log_index:
-            err_msg = (self.logs[-1].log_index, self.commit_index, prev_log_index)
+            err_msg = (self.logs[-1].log_index, self.commit_index, prev_log_index,
+                self.logs[-1].term, self.logs[-1], entries)
             assert self.logs[-1].log_index > self.commit_index, err_msg
             assert self.logs[-1].log_index > 0
             self.logs.pop()
@@ -380,6 +386,7 @@ class State(object):
         return last_log_index
 
     def apply_commit(self, leader_commit):
+        assert not isinstance(self, LeaderState)
         last_log_index = self.logs[-1].log_index
         assert leader_commit <= last_log_index
         if leader_commit > self.commit_index:
@@ -447,11 +454,14 @@ class LeaderState(State):
         self.slave_ids = [nid for nid in self.node_table.keys() if nid != self.node_id]
         self.client_map = {}  # log_index => client_id
         self.query_queue = []
-        self.query_heart_beat_tags = {sid: False for sid in self.slave_ids}
+        self.query_heart_beat_tags = {sid: 0 for sid in self.slave_ids}
 
         # no-op item
         self.no_op_committed = False
         self.no_op_index = self.add_no_op()
+
+        # for read
+        self.read_req_index = 0
 
         self.slave_timers = {
             nid: VariableTimer(self.send_heartbeat,
@@ -461,13 +471,19 @@ class LeaderState(State):
         }
         self.broadcast_heartbeat()
 
+    def gen_read_req_index(self):
+        # TODO: handle the overflow
+        self.read_req_index += 1
+        return self.read_req_index
+
     def broadcast_heartbeat(self):
         for node_id, node in self.node_table.iteritems():
             if node_id == self.node_id:
                 continue
             self.send_heartbeat(node_id)
 
-    def send_heartbeat(self, slave_id):
+    def send_heartbeat(self, slave_id, read_index=None):
+        read_index = read_index or self.read_req_index
         start_index = self.next_index[slave_id]
         assert start_index > 0
         self.debug('start_index->{}: {}'.format(slave_id, start_index))
@@ -476,7 +492,7 @@ class LeaderState(State):
         prev_log_term = self.logs[start_index - 1].term
         entries = [l.to_dict() for l in self.logs[start_index:]]
         heartbeat = AppendEntries(self.current_term, self.node_id,
-            prev_log_index, prev_log_term, self.commit_index, entries)
+            prev_log_index, prev_log_term, self.commit_index, read_index, entries)
         self.debug('sending heartbeat to {}'.format(slave_id))
         self.send_queue.append((slave_id, heartbeat))
 
@@ -498,12 +514,14 @@ class LeaderState(State):
             last_log_index = self.recv_entries(rpc)
             success = last_log_index is not None
             return AppendEntriesResponse(self.node_id, self.current_term,
-                                         success, last_log_index)
+                                         success, last_log_index,
+                                         rpc.read_index)
         elif rpc.term < self.current_term:
             self.info(
                 'heartbeat from another leader with lower term {} > {}' \
                     .format(self.current_term, rpc.term))
-            return AppendEntriesResponse(self.node_id, self.current_term, False, None)
+            return AppendEntriesResponse(self.node_id, self.current_term,
+                                         False, None, rpc.read_index)
         else:
             assert rpc.term == self.current_term
             raise Exception(
@@ -513,6 +531,9 @@ class LeaderState(State):
         vote_granted = rpc.term > self.current_term and self.cmp_log(rpc) <= 0
         if vote_granted:
             self.info('vote granted to {}'.format(rpc.candidate_id))
+        if rpc.term > self.current_term:
+            # TODO: we can use a small election timeout to
+            # speed up the election, because we have the newest log now.
             self.update_term_if_needed(rpc)
             self.change_to_follower()
         else:
@@ -541,7 +562,7 @@ class LeaderState(State):
             self.send_heartbeat(node_id)
             self.slave_timers[node_id].reset()
 
-        self.tag_query_heart_beat(node_id)
+        self.tag_query_heart_beat(node_id, response.read_index)
 
     def propose_request_handler(self, propose):
         self.logs.append(LogEntry(self.current_term,
@@ -577,7 +598,7 @@ class LeaderState(State):
     def check_success_proposol(self):
         last_log_index = self.logs[-1].log_index
         for i in range(self.commit_index + 1, last_log_index + 1):
-            count = len(map(lambda mi: mi >= i, self.match_index.values()))
+            count = len(filter(lambda mi: mi >= i, self.match_index.values()))
             if count <= len(self.node_table) / 2:
                 break
             if i in self.client_map:
@@ -585,7 +606,9 @@ class LeaderState(State):
             log = self.logs[self.get_index_by_log_index(i)]
             assert log is not None
             self.apply_state_machine(log)
-            self.commit_index = log.log_index
+            # only commit item from current term
+            if log.term == self.current_term:
+                self.commit_index = log.log_index
 
             if i == self.no_op_index:
                 self.no_op_committed = True
@@ -599,37 +622,40 @@ class LeaderState(State):
         if not self.no_op_committed:
             self.respond_not_avalible(query)
             return
-        if len(self.query_queue) == 0:
-            self.clear_query_heart_beat_tags()
-        self.query_queue.append(query)
+        read_index = self.gen_read_req_index()
+        self.query_queue.append((read_index, query))
         for nid in self.slave_ids:
-            self.send_heartbeat(nid)
+            self.send_heartbeat(nid, read_index)
             self.slave_timers[nid].reset()
             self.slave_timers[nid].change_timeout(QUERY_HEART_BEAT_INTERVAL)
 
     def check_success_query(self):
         if len(self.query_queue) == 0:
             return
-        count = len(filter(None, self.query_heart_beat_tags.values()))
-        if count <= len(self.node_table) / 2:
-            return
-        self.debug('responding batch len: {}'.format(len(self.query_queue)))
-        for q in self.query_queue:
+        max_ok_read_index = self.gen_max_ok_read_index()
+        read_count = 0
+        for read_index, q in self.query_queue:
+            if read_index > max_ok_read_index:
+                break
             self.respond_query(q)
-        self.query_queue = []
-        self.clear_query_heart_beat_tags()
+            read_count += 1
+        self.debug('responding batch len: {}'.format(read_count))
+        self.query_queue = self.query_queue[read_count:]
+        if len(self.query_queue) > 0:
+            return
         for nid in self.slave_ids:
             if self.slave_timers[nid].timeout == QUERY_HEART_BEAT_INTERVAL:
                 self.slave_timers[nid].change_timeout(IDLE_HEART_BEAT_INTERVAL)
 
-    def tag_query_heart_beat(self, slave_id):
+    def gen_max_ok_read_index(self):
+        read_indices = sorted(self.query_heart_beat_tags.values())
+        return read_indices[int(len(self.node_table) / 2)]
+
+    def tag_query_heart_beat(self, slave_id, read_index):
         if len(self.query_queue) == 0:
             return
-        self.query_heart_beat_tags[slave_id] = True
-
-    def clear_query_heart_beat_tags(self):
-        for sid in self.slave_ids:
-            self.query_heart_beat_tags[sid] = False
+        if self.query_heart_beat_tags[slave_id] < read_index:
+            self.query_heart_beat_tags[slave_id] = read_index
 
     def respond_query(self, query):
         client_id = query.client_id
@@ -670,7 +696,7 @@ class FollowerState(State):
             last_log_index = self.recv_entries(rpc)
             success = last_log_index is not None
         return AppendEntriesResponse(self.node_id, self.current_term,
-                                     success, last_log_index)
+                                     success, last_log_index, rpc.read_index)
 
     def request_vote_handler(self, rpc):
         self.info('receive request vote from {}'.format(rpc.candidate_id))
@@ -731,9 +757,11 @@ class CandidateState(State):
             last_log_index = self.recv_entries(rpc)
             success = last_log_index is not None
             return AppendEntriesResponse(self.node_id, self.current_term,
-                                         success, last_log_index)
+                                         success, last_log_index,
+                                         rpc.read_index)
         self.info('reject heartbeat from {}'.format(rpc.leader_id))
-        return AppendEntriesResponse(self.node_id, self.current_term, False, None)
+        return AppendEntriesResponse(self.node_id, self.current_term, False,
+                                     None, rpc.read_index)
 
     def request_vote_handler(self, rpc):
         self.info('receive request vote from {}'.format(rpc.candidate_id))

@@ -23,9 +23,9 @@ INFO = 'INFO'
 ''' Command
 Inner commands:
 REQUESTVOTE term candidate_id last_log_index last_log_term
-APPENDENTRY term leader_id prev_log_index prev_log_term leader_commit [entries...]
+APPENDENTRY term leader_id prev_log_index prev_log_term leader_commit read_index [entries...]
 RESPONSEVOTE src_node_id term vote_granted
-RESPONSEAPPEND src_node_id term success last_recv_index
+RESPONSEAPPEND src_node_id term success last_recv_index read_index
 
 Outer commands:
 AQUAR RAFT INFO
@@ -60,7 +60,7 @@ def encode_request_vote(request_vote):
 
 
 def encode_append_entries(append_entries):
-    return '{} {} {} {} {} {} {} {}'.format(
+    return '{} {} {} {} {} {} {} {} {}'.format(
         CMD_PREFIX,
         APPENDENTRY,
         append_entries.term,
@@ -68,6 +68,7 @@ def encode_append_entries(append_entries):
         append_entries.prev_log_index,
         append_entries.prev_log_term,
         append_entries.leader_commit,
+        append_entries.read_index,
         json.dumps(append_entries.entries).replace(' ', ''),
     )
 
@@ -83,13 +84,14 @@ def encode_request_vote_response(request_vote_response):
 
 
 def encode_append_entries_response(append_entries_response):
-    return '{} {} {} {} {} {}'.format(
+    return '{} {} {} {} {} {} {}'.format(
         CMD_PREFIX,
         RESPONSEAPPEND,
         append_entries_response.node_id,
         append_entries_response.term,
         1 if append_entries_response.success else 0,
-        append_entries_response.last_recv_index
+        append_entries_response.last_recv_index,
+        append_entries_response.read_index,
     )
 
 
@@ -107,9 +109,10 @@ def decode_append_entries(redis_response):
     prev_log_index = int(redis_response[2])
     prev_log_term = int(redis_response[3])
     leader_commit = int(redis_response[4])
-    entries = [LogEntry(**e) for e in json.loads(redis_response[5])]
+    read_index = int(redis_response[5])
+    entries = [LogEntry(**e) for e in json.loads(redis_response[6])]
     return AppendEntries(term, leader_id,
-        prev_log_index, prev_log_term, leader_commit, entries)
+        prev_log_index, prev_log_term, leader_commit, read_index, entries)
 
 
 def decode_request_vote_response(redis_response):
@@ -127,7 +130,9 @@ def decode_append_entries_response(redis_response):
         last_recv_index = int(redis_response[3])
     else:
         last_recv_index = None
-    return AppendEntriesResponse(node_id, term, success, last_recv_index)
+    read_index = int(redis_response[4])
+    return AppendEntriesResponse(node_id, term, success, last_recv_index,
+                                 read_index)
 
 
 class RaftServer(object):
