@@ -158,6 +158,6 @@ class RedisProtocolHandler(object):
             self.conn.sendall(data)
         except socket.error as e:
             logger.error(e)
+            self.broken = True
             if 'Bad file descriptor' not in str(e):
                 raise
-            self.broken = True
