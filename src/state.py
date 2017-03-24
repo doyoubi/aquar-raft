@@ -87,25 +87,26 @@ class ProposeRequest(Rpc):
 
 
 class ProposeResponse(Rpc):
-    def __init__(self, client_id, redirect_node_id, error):
+    def __init__(self, client_id, redirect_node_id, error, item):
         self.client_id = client_id
         self.redirect_node_id = redirect_node_id
         self.error = error
+        self.item = item
 
     @classmethod
-    def gen_success_resp(cls, client_id):
+    def gen_success_resp(cls, item, client_id):
         # leader
-        return cls(client_id, None, None)
+        return cls(client_id, None, None, item)
 
     @classmethod
-    def gen_redirect_resp(cls, client_id, redirect_node_id):
+    def gen_redirect_resp(cls, item, client_id, redirect_node_id):
         # follower
-        return cls(client_id, redirect_node_id, None)
+        return cls(client_id, redirect_node_id, None, item)
 
     @classmethod
-    def gen_error_resp(cls, client_id, error):
+    def gen_error_resp(cls, item, client_id, error):
         # candidate
-        return cls(client_id, None, error)
+        return cls(client_id, None, error, item)
 
 
 class QueryRequest(Rpc):
@@ -115,33 +116,34 @@ class QueryRequest(Rpc):
 
 
 class QueryResponse(Rpc):
-    def __init__(self, client_id, redirect_node_id, error, result):
+    def __init__(self, client_id, redirect_node_id, error, result, item):
         self.client_id = client_id
         self.redirect_node_id = redirect_node_id
         self.error = error
         self.result = result
         self.not_available = False
+        self.item = item
 
     @classmethod
-    def gen_success_resp(cls, client_id, result):
+    def gen_success_resp(cls, item, client_id, result):
         # leader
-        return cls(client_id, None, None, result)
+        return cls(client_id, None, None, result, item)
 
     @classmethod
-    def gen_not_available(cls, client_id):
-        res = cls(client_id, None, None, None)
+    def gen_not_available(cls, item, client_id):
+        res = cls(client_id, None, None, None, item)
         res.not_available = True
         return res
 
     @classmethod
-    def gen_redirect_resp(cls, client_id, redirect_node_id):
+    def gen_redirect_resp(cls, item, client_id, redirect_node_id):
         # follower
-        return cls(client_id, redirect_node_id, None, None)
+        return cls(client_id, redirect_node_id, None, None, item)
 
     @classmethod
-    def gen_error_resp(cls, client_id, error):
+    def gen_error_resp(cls, item, client_id, error):
         # candidate
-        return cls(client_id, None, error, None)
+        return cls(client_id, None, error, None, item)
 
 
 NO_OP_ITEM = 'no-op-item'
@@ -602,7 +604,7 @@ class LeaderState(State):
             if count <= len(self.node_table) / 2:
                 break
             if i in self.client_map:
-                self.respond_proposol(i)
+                self.respond_proposol(i, self.logs[self.get_index_by_log_index(i)].item)
             log = self.logs[self.get_index_by_log_index(i)]
             assert log is not None
             self.apply_state_machine(log)
@@ -613,9 +615,9 @@ class LeaderState(State):
             if i == self.no_op_index:
                 self.no_op_committed = True
 
-    def respond_proposol(self, log_index):
+    def respond_proposol(self, log_index, item):
         client_id = self.client_map.pop(log_index)
-        rpc = ProposeResponse.gen_success_resp(client_id)
+        rpc = ProposeResponse.gen_success_resp(item, client_id)
         self.client_resp_queue.append((client_id, rpc))
 
     def query_request_handler(self, query):
@@ -663,12 +665,12 @@ class LeaderState(State):
         assert cmd[0].upper() == 'GET'
         key = cmd[1]
         value = self.kvstorage.get(key)
-        rpc = QueryResponse.gen_success_resp(client_id, value)
+        rpc = QueryResponse.gen_success_resp(query.item, client_id, value)
         self.client_resp_queue.append((client_id, rpc))
 
     def respond_not_avalible(self, query):
         client_id = query.client_id
-        rpc = QueryResponse.gen_not_available(client_id)
+        rpc = QueryResponse.gen_not_available(query.item, client_id)
         self.client_resp_queue.append((client_id, rpc))
 
 
@@ -715,12 +717,12 @@ class FollowerState(State):
 
     def propose_request_handler(self, propose):
         client_id = propose.client_id
-        rpc = ProposeResponse.gen_redirect_resp(client_id, self.leader_id)
+        rpc = ProposeResponse.gen_redirect_resp(propose.item, client_id, self.leader_id)
         self.client_resp_queue.append((client_id, rpc))
 
     def query_request_handler(self, query):
         client_id = query.client_id
-        rpc = QueryResponse.gen_redirect_resp(client_id, self.leader_id)
+        rpc = QueryResponse.gen_redirect_resp(query.item, client_id, self.leader_id)
         self.client_resp_queue.append((client_id, rpc))
 
 
@@ -792,10 +794,10 @@ class CandidateState(State):
 
     def propose_request_handler(self, propose):
         client_id = propose.client_id
-        rpc = ProposeResponse.gen_error_resp(client_id, 'No Leader')
+        rpc = ProposeResponse.gen_error_resp(propose.item, client_id, 'No Leader')
         self.client_resp_queue.append((client_id, rpc))
 
     def query_request_handler(self, query):
         client_id = query.client_id
-        rpc = QueryResponse.gen_error_resp(client_id, 'No Leader')
+        rpc = QueryResponse.gen_error_resp(query.item, client_id, 'No Leader')
         self.client_resp_queue.append((client_id, rpc))

@@ -1,7 +1,7 @@
 NODE_TABLE = {
-    'n0': {'host': 'localhost', 'port': 9000 },
-    'n1': {'host': 'localhost', 'port': 9001 },
-    'n2': {'host': 'localhost', 'port': 9002 },
+    'n0': {'host': '127.0.0.1', 'port': 9000 },
+    'n1': {'host': '127.0.0.1', 'port': 9001 },
+    'n2': {'host': '127.0.0.1', 'port': 9002 },
 }
 ELECTION_TIMEOUT_RANGE = [1500, 3000]
 BROADCAST_REQUEST_VOTE_INTERVAL = 200

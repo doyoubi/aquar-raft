@@ -1,5 +1,6 @@
 import logging
 import json
+import crc16
 
 import gevent
 import redis
@@ -172,6 +173,8 @@ class RaftServer(object):
             self.handle_get_request(cmd, address, proto_handler)
         elif cmd[0].lower() == 'dump':
             self.handle_dump_request(proto_handler)
+        elif cmd[0].lower() == 'cluster' and cmd[1].lower() == 'nodes':
+            self.handle_cluster_nodes(proto_handler)
         else:
             raise InvalidCmd(cmd)
 
@@ -215,6 +218,9 @@ class RaftServer(object):
             lines += '{}:{}\n'.format(k, v)
         proto_handler.send_data(lines)
 
+    def gen_slot(self, key):
+        return crc16.crc16xmodem(key) % 16384
+
     def handle_set_request(self, cmd, client_id, proto_handler):
         if len(cmd) != 3:
             raise InvalidCmd(cmd)
@@ -227,7 +233,8 @@ class RaftServer(object):
         elif propose_response.redirect_node_id:
             node = self.node_table[propose_response.redirect_node_id]
             addr = '{host}:{port}'.format(**node)
-            proto_handler.send_err('MOVED {}'.format(addr))
+            slot = self.gen_slot(propose_response.item[1])
+            proto_handler.send_err('MOVED {} {}'.format(slot, addr))
         else:
             proto_handler.send_ok()
 
@@ -243,7 +250,8 @@ class RaftServer(object):
         elif query_response.redirect_node_id:
             node = self.node_table[query_response.redirect_node_id]
             addr = '{host}:{port}'.format(**node)
-            proto_handler.send_err('MOVED {}'.format(addr))
+            slot = self.gen_slot(query_response.item[1])
+            proto_handler.send_err('MOVED {} {}'.format(slot, addr))
         elif query_response.not_available:
             proto_handler.send_err('LEADER NOT READY')
         elif query_response.result is None:
@@ -289,6 +297,43 @@ class RaftServer(object):
             '{}:{}'.format(f, v) for f, v in info.iteritems()
             )
         return packet
+
+    def handle_cluster_nodes(self, proto_handler):
+        line_fmt = '{name} {addr} {myself}{role} {slaveof} {ping_sent} ' \
+                   '{pong_sent} {config_epoch} {connected}{slots}'
+        basic_dict = {
+            'ping_sent': 0,
+            'pong_sent': 0,
+            'connected': 'connected',
+        }
+        lines = []
+        for node_id, addr in self.node_table.items():
+            name = '{:0>40}'.format(node_id)
+            addr = '{}:{}'.format(addr["host"], addr["port"])
+            myself = 'myself,' if node_id == self.node_id else ''
+            if node_id == self.state.leader_id:
+                slaveof = '-'
+                role = 'master'
+                slots = ' 0-16383'
+            else:
+                leader_id = self.state.leader_id
+                leader_id = leader_id if leader_id else 'no_leader'
+                slaveof = '{:0>40}'.format(leader_id)
+                role = 'slave'
+                slots = ''
+            config_epoch = self.state.current_term
+            lines.append(line_fmt.format(
+                name=name,
+                addr=addr,
+                myself=myself,
+                role=role,
+                slaveof=slaveof,
+                config_epoch=config_epoch,
+                slots=slots,
+                **basic_dict
+                ))
+        output = '\n'.join(lines) + '\n'
+        proto_handler.send_data(output)
 
     def send_rpc(self, node_id, rpc):
         if isinstance(rpc, RequestVote):
