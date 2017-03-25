@@ -91,20 +91,14 @@ class RedisProtocolServer(object):
         addr = '{}:{}'.format(*address)
         proto_handler = RedisProtocolHandler(conn,
                                              self.cmd_server.handle_cmd)
-        timeout = 5
-        start = time.time()
         while not proto_handler.broken:
             data = self.read_request(conn, address, proto_handler)
-            if time.time() - start > timeout:
-                logger.error('client time out')
-                break
             if not data and proto_handler.response_sent:
                 break
-            if not data:
-                continue
-            start = time.time()
-            proto_handler.handle_read(addr, data)
+            if data:
+                proto_handler.handle_read(addr, data)
             gevent.sleep(0)  # switch
+        logger.info('connection closed')
         conn.close()
 
     def read_request(self, conn, address, proto_handler):

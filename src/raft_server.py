@@ -1,7 +1,8 @@
 import logging
 import json
-import crc16
+import time
 
+import crc16
 import gevent
 import redis
 
@@ -150,9 +151,7 @@ class RaftServer(object):
         self.node_table = shard['nodes']
         self.state = FollowerState(self, shard['term'])
         self.client_map = {}
-
-    def remove_client(self, client_id):
-        return self.client_map.pop(client_id)
+        self.client_time_map = {}
 
     def handle_cmd(self, address, cmd, proto_handler):
         logger.info('recv from {}: {}'.format(address, repr(' '.join(cmd))))
@@ -165,15 +164,16 @@ class RaftServer(object):
     def dispatch_cmd(self, address, cmd, proto_handler):
         if cmd[0].lower() == 'aquar' and cmd[1].lower() == 'raft':
             self.handle_aquar_raft(cmd[2:], proto_handler)
-        elif cmd[0].lower() == 'set':
+        elif len(cmd) == 3 and cmd[0].lower() == 'set':
             self.add_unfinished_client(address, proto_handler)
             self.handle_set_request(cmd, address, proto_handler)
-        elif cmd[0].lower() == 'get':
+        elif len(cmd) == 2 and cmd[0].lower() == 'get':
             self.add_unfinished_client(address, proto_handler)
             self.handle_get_request(cmd, address, proto_handler)
         elif cmd[0].lower() == 'dump':
             self.handle_dump_request(proto_handler)
-        elif cmd[0].lower() == 'cluster' and cmd[1].lower() == 'nodes':
+        elif len(cmd) == 2 and \
+                cmd[0].lower() == 'cluster' and cmd[1].lower() == 'nodes':
             self.handle_cluster_nodes(proto_handler)
         else:
             raise InvalidCmd(cmd)
@@ -181,10 +181,13 @@ class RaftServer(object):
     def add_unfinished_client(self, client_id, proto_handler):
         proto_handler.response_sent = False
         self.client_map[client_id] = proto_handler
+        self.client_time_map[client_id] = time.time()
 
     def remove_unfinished_client(self, client_id):
         proto_handler = self.client_map.pop(client_id)
         proto_handler.response_sent = True
+        start = self.client_time_map.pop(client_id)
+        logger.info('finish request using {}'.format(time.time() - start))
 
     def handle_aquar_raft(self, cmd, proto_handler):
         subcmd = cmd[0].upper()
