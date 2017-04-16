@@ -557,7 +557,8 @@ class LeaderState(State):
             last_log_index = self.logs[-1].log_index
             if last_log_index + 1 == self.next_index[node_id]:
                 self.slave_timers[node_id].change_timeout(IDLE_HEART_BEAT_INTERVAL)
-            self.debug('heartbeat succeeded')
+            self.debug('heartbeat succeeded, last_recv_index: {}'.format(response.last_recv_index))
+            self.debug('match_index: {}'.format(self.match_index))
         else:
             self.debug("heartbeat failed")
             self.next_index[node_id] -= 1
@@ -601,7 +602,7 @@ class LeaderState(State):
         last_log_index = self.logs[-1].log_index
         for i in range(self.commit_index + 1, last_log_index + 1):
             count = len(filter(lambda mi: mi >= i, self.match_index.values()))
-            if count <= len(self.node_table) / 2:
+            if count < len(self.node_table) / 2:
                 break
             if i in self.client_map:
                 self.respond_proposol(i, self.logs[self.get_index_by_log_index(i)].item)
